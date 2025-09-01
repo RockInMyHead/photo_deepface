@@ -1,0 +1,8 @@
+streamlit
+insightface
+onnxruntime
+scikit-learn
+opencv-python
+pillow
+numpy
+tqdm

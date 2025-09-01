@@ -1,0 +1,10 @@
+{
+  "group_thr": 3,
+  "eps_sim": 0.55,
+  "min_samples": 2,
+  "min_face": 110,
+  "blur_thr": 45.0,
+  "det_size": 640,
+  "gpu_id": 0,
+  "match_thr": 0.6
+}
