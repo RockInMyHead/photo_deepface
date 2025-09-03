@@ -1,5 +1,5 @@
 # app.py
-# Minimal Explorer (revised): Refresh button, 150x150 thumbnails, richer logs after processing
+# Minimal Explorer: Pick Folder -> Native dialog -> Minimal file browser -> Queue + Process
 import json
 import shutil
 from pathlib import Path
@@ -30,18 +30,12 @@ except Exception:
     def build_plan(*args, **kwargs):
         return {"eligible_clusters": [], "cluster_centroids": {}, "cluster_images": {}, "group_only_images": [], "unknown_images": [], "stats":{"images_total":0,"images_unknown_only":0,"images_group_only":0}}
 
-# Optional PIL for exact 150x150 thumbnails
-try:
-    from PIL import Image
-except Exception:
-    Image = None
-
-st.set_page_config(page_title="Face Sorter — Мини‑проводник", layout="wide")
+st.set_page_config(page_title="Face Sorter — Explorer", layout="wide")
 
 # ---- Minimal CSS ----
 st.markdown("""
 <style>
-  .row { display:grid; grid-template-columns: 160px 1fr 110px 170px 120px; gap:8px; align-items:center; padding:6px 8px; border-bottom:1px solid #f1f5f9;}
+  .row { display:grid; grid-template-columns: 28px 1fr 110px 170px 120px; gap:8px; align-items:center; padding:6px 8px; border-bottom:1px solid #f1f5f9;}
   .row:hover { background:#f8fafc; }
   .hdr { font-weight:600; color:#334155; border-bottom:1px solid #e2e8f0; }
   .name { display:flex; align-items:center; gap:8px; }
@@ -51,7 +45,6 @@ st.markdown("""
   .addr { display:flex; gap:8px; align-items:center; }
   .crumb { border:1px solid transparent; padding:4px 8px; border-radius:8px; }
   .crumb:hover { background:#f1f5f9; border-color:#e5e7eb; }
-  .thumbbox { width:150px; height:150px; display:flex; align-items:center; justify-content:center; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden; background:#fff; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -90,7 +83,6 @@ def _init_state():
     st.session_state.setdefault("rename_target", None)   # str path
     st.session_state.setdefault("queue", [])
     st.session_state.setdefault("logs", [])
-    st.session_state.setdefault("proc_logs", [])         # detailed processing logs
 
 def log(msg: str):
     st.session_state["logs"].append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -223,24 +215,6 @@ def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int,
     processed_images = processed_images.intersection(all_in_group)
     return len(person_idx["persons"]), processed_images
 
-def make_square_thumb(img_path: Path, size: int = 150):
-    """Return a PIL.Image square thumbnail (size x size). Fallback: None."""
-    if Image is None:
-        return None
-    try:
-        im = Image.open(img_path).convert("RGB")
-        # Center-crop to square
-        w, h = im.size
-        if w != h:
-            min_side = min(w, h)
-            left = (w - min_side) // 2
-            top = (h - min_side) // 2
-            im = im.crop((left, top, left + min_side, top + min_side))
-        im = im.resize((size, size))
-        return im
-    except Exception:
-        return None
-
 # ---- UI State ----
 _init_state()
 
@@ -256,33 +230,28 @@ if st.session_state["parent_path"] is None:
             st.session_state["current_dir"] = folder
             st.rerun()
 else:
-    # Address / Up / Refresh
+    # Address / Up
     curr = Path(st.session_state["current_dir"]).expanduser().resolve()
     parent_root = Path(st.session_state["parent_path"]).expanduser().resolve()
 
-    top_cols = st.columns([0.08, 0.12, 0.80])
-    with top_cols[0]:
+    addr_col1, addr_col2 = st.columns([0.08, 0.92])
+    with addr_col1:
         up = curr.parent if curr != curr.anchor else None
-        st.button("⬆️ Вверх", key="up", disabled=(up is None),
-                  on_click=(lambda: st.session_state.update({"current_dir": str(up)}) if up else None),
-                  use_container_width=True)
-    with top_cols[1]:
-        if st.button("🔄 Обновить", use_container_width=True):
-            st.rerun()
-    with top_cols[2]:
+        st.button("⬆️ Вверх", key="up", disabled=(up is None), on_click=(lambda: st.session_state.update({"current_dir": str(up)}) if up else None), use_container_width=True)
+    with addr_col2:
+        # Breadcrumbs (minimal)
         crumbs = list(curr.parts)
         accum = Path(crumbs[0])
         bc_cols = st.columns(len(crumbs))
         for i, part in enumerate(crumbs):
             if i > 0: accum = accum / part
             with bc_cols[i]:
-                st.button(part or "/", key=f"bc::{i}", use_container_width=True,
-                          on_click=lambda p=str(accum): st.session_state.update({"current_dir": p}))
+                st.button(part or "/", key=f"bc::{i}", use_container_width=True, on_click=lambda p=str(accum): st.session_state.update({"current_dir": p}))
 
     st.markdown("---")
 
     # Header row
-    st.markdown('<div class="row hdr"><div>Превью</div><div>Имя</div><div>Тип</div><div>Изменён</div><div>Размер</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="row hdr"><div></div><div>Имя</div><div>Тип</div><div>Изменён</div><div>Размер</div></div>', unsafe_allow_html=True)
 
     # Directory listing
     items = list_dir(curr)
@@ -294,23 +263,18 @@ else:
         ren_key = f"ren::{item}"
         ren_input_key = f"ren_input::{item}"
 
-        c1, c2, c3, c4, c5 = st.columns([0.14, 0.58, 0.12, 0.14, 0.10])
-
-        # Preview (150x150 for images only)
+        c1, c2, c3, c4, c5 = st.columns([0.06, 0.60, 0.12, 0.14, 0.08])
         with c1:
-            if not is_dir and item.suffix.lower() in IMG_EXTS:
-                im = make_square_thumb(item, 150)
-                if im is not None:
-                    st.image(im, use_container_width=False)
+            if is_dir:
+                checked = st.checkbox("", key=sel_key, value=(str(item) in st.session_state["selected_dirs"]))
+                if checked:
+                    st.session_state["selected_dirs"].add(str(item))
                 else:
-                    st.image(str(item), width=150, use_container_width=False)  # fallback
-            else:
-                st.markdown('<div class="thumbbox">📁</div>' if is_dir else '<div class="thumbbox">🗎</div>', unsafe_allow_html=True)
-
-        # Name + inline icons
+                    st.session_state["selected_dirs"].discard(str(item))
         with c2:
             icon = "📁" if is_dir else "🗎"
-            name_cols = st.columns([0.72, 0.10, 0.10, 0.08])
+            # Name + inline action icons
+            name_cols = st.columns([0.75, 0.08, 0.08, 0.09])
             with name_cols[0]:
                 if is_dir:
                     if st.button(f"{icon} {item.name}", key=name_btn_key, use_container_width=True):
@@ -319,16 +283,9 @@ else:
                 else:
                     st.write(f"{icon} {item.name}")
             with name_cols[1]:
-                if is_dir:
-                    checked = st.checkbox("", key=sel_key, value=(str(item) in st.session_state["selected_dirs"]), help="В очередь")
-                    if checked:
-                        st.session_state["selected_dirs"].add(str(item))
-                    else:
-                        st.session_state["selected_dirs"].discard(str(item))
-            with name_cols[2]:
                 if st.button("✏️", key=ren_key, help="Переименовать", use_container_width=True):
                     st.session_state["rename_target"] = str(item)
-            with name_cols[3]:
+            with name_cols[2]:
                 if st.button("🗑️", key=del_key, help="Удалить", use_container_width=True):
                     try:
                         if is_dir:
@@ -338,7 +295,9 @@ else:
                         st.rerun()
                     except Exception as e:
                         st.error(f"Ошибка удаления: {e}")
-
+            with name_cols[3]:
+                if not is_dir and item.suffix.lower() in IMG_EXTS:
+                    st.button("👁️", key=f"prev::{item}", help="Предпросмотр", use_container_width=True, on_click=lambda p=str(item): st.session_state.update({"preview": p}))
         with c3:
             st.write("Папка" if is_dir else (item.suffix[1:].upper() if item.suffix else "Файл"))
         with c4:
@@ -374,6 +333,13 @@ else:
                     st.session_state["rename_target"] = None
                     st.rerun()
 
+    # Optional preview (single file image)
+    prev = st.session_state.get("preview")
+    if prev:
+        pp = Path(prev)
+        if pp.exists() and pp.is_file() and pp.suffix.lower() in IMG_EXTS:
+            st.image(str(pp), caption=pp.name, use_container_width=True)
+
     st.markdown("---")
 
     # Footer actions
@@ -398,8 +364,6 @@ else:
     if st.button("▶️ Обработать", type="primary"):
         parent = parent_root
         idx = load_index(parent)
-        st.session_state["proc_logs"] = []  # reset
-
         # Targets = queue or all subfolders of current_dir
         targets = [Path(p) for p in st.session_state["queue"]]
         if not targets:
@@ -408,8 +372,6 @@ else:
             st.warning("Нет целей для обработки.")
         else:
             tot_total = tot_unknown = tot_group_only = 0
-            tot_faces = tot_unique_people = tot_joint = 0
-
             progress = st.progress(0, text="Инициализация…")
             status = st.status("Идёт обработка…", expanded=True)
             with status:
@@ -426,55 +388,19 @@ else:
                             det_size=CFG["det_size"],
                             gpu_id=CFG["gpu_id"],
                         )
-                        # Derive per-group metrics
-                        cluster_images = plan.get("cluster_images", {}) or {}
-                        faces_detections = sum(len(v) for v in cluster_images.values())
-                        unique_people_in_run = len(plan.get("eligible_clusters", []))
-                        # joint images (same image belongs to >=2 clusters)
-                        freq = {}
-                        for imgs in cluster_images.values():
-                            for pth in imgs:
-                                freq[pth] = freq.get(pth, 0) + 1
-                        joint_images = sum(1 for v in freq.values() if v >= 2)
-
                         persons_after, processed_images = match_and_apply(gdir, plan, match_thr=CFG["match_thr"])
                         idx["group_counts"][str(gdir)] = persons_after
                         cleanup_processed_images(gdir, processed_images)
-
-                        # Aggregate stats
                         tot_total  += plan["stats"]["images_total"]
                         tot_unknown += plan["stats"]["images_unknown_only"]
                         tot_group_only += plan["stats"]["images_group_only"]
-                        tot_faces += faces_detections
-                        tot_unique_people += unique_people_in_run
-                        tot_joint += joint_images
-
-                        st.success(
-                            f"{gdir.name}: фото={plan['stats']['images_total']}, уник.людей={unique_people_in_run}, "
-                            f"детекций лиц={faces_detections}, group_only={plan['stats']['images_group_only']}, совместных={joint_images}"
-                        )
-                        st.session_state["proc_logs"].append(
-                            f"{gdir.name}: людей(детекции)={faces_detections}; уникальные люди={unique_people_in_run}; "
-                            f"общие(group_only)={plan['stats']['images_group_only']}; совместные(>1 человек)={joint_images}"
-                        )
+                        st.success(f"Готово: {gdir.name}")
                     except Exception as e:
                         st.error(f"Ошибка в {gdir.name}: {e}")
-                        st.session_state["proc_logs"].append(f"{gdir.name}: ошибка — {e}")
-
                     progress.progress(k/len(targets), text=f"{k}/{len(targets)}")
-
             idx["global_stats"]["images_total"] += tot_total
             idx["global_stats"]["images_unknown_only"] += tot_unknown
             idx["global_stats"]["images_group_only"] += tot_group_only
             save_index(parent, idx)
             st.session_state["queue"] = []
-
             st.success("Обработка завершена.")
-            st.markdown("**Сводка за прогон:**")
-            st.write(f"- Людей на фото (детекции): **{tot_faces}**")
-            st.write(f"- Уникальных людей (кластера): **{tot_unique_people}**")
-            st.write(f"- Общих фото (group_only): **{tot_group_only}**")
-            st.write(f"- Совместных фото (>1 человек): **{tot_joint}**")
-
-            st.markdown("**Детальные логи по группам:**")
-            st.text_area("Логи", value="\\n".join(st.session_state.get("proc_logs", [])), height=220)
