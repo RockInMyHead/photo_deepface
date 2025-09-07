@@ -1,7 +1,7 @@
 # app.py
-# Explorer (compact DnD): LAN URL, cached thumbnails, safe ops, sandboxed nav,
+# Explorer (compact DnD): LAN URL, cached thumbs, safe ops, sandboxed nav,
 # atomic JSON writes, progress-in-status, scrollable explorer (700px),
-# and COMPACT "D&D mode" inside the same module (folders + photos only).
+# and COMPACT in-place Drag&Drop (folders + images → folders/Up).
 
 import json
 import shutil
@@ -63,38 +63,31 @@ except Exception:
 
 st.set_page_config(page_title="Face Sorter — Мини-проводник", layout="wide")
 
-# ---- Minimal CSS ----
+# ---- CSS ----
 st.markdown("""
 <style>
   .row { display:grid; grid-template-columns: 160px 1fr 110px 170px 120px; gap:8px; align-items:center; padding:6px 8px; border-bottom:1px solid #f1f5f9;}
   .row:hover { background:#f8fafc; }
   .hdr { font-weight:600; color:#334155; border-bottom:1px solid #e2e8f0; }
   .thumbbox { width:150px; height:150px; display:flex; align-items:center; justify-content:center; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden; background:#fff; }
-  .muted { color:#64748b; font-size:12px; }
   .crumb { border:1px solid transparent; padding:4px 8px; border-radius:8px; }
   .crumb:hover { background:#f1f5f9; border-color:#e5e7eb; }
-
-  /* Compact DnD styling — делает контейнеры похожими на строки */
-  div[data-testid="stSortables"] > div > h3 { display:none; } /* прячем заголовок блока */
+  /* Compact DnD visuals */
+  div[data-testid="stSortables"] > div > h3 { display:none; }
   div[data-testid="stSortables"] ul { margin:0 !important; padding:0 !important; }
   div[data-testid="stSortables"] li {
       list-style:none; margin:0 0 2px 0 !important; padding:6px 8px !important;
       border:1px dashed #e5e7eb; border-radius:8px; background:#fff;
       display:flex; align-items:center; gap:8px;
+      font-size: 13px;
   }
-  /* «приёмники» для папок — компактные строки */
-  .dnd-target { display:grid; grid-template-columns: 160px 1fr 110px 170px 120px;
-                gap:8px; align-items:center; padding:6px 8px; border:1px dashed #e5e7eb;
-                border-radius:10px; background:#fcfcfd; }
-  .dnd-target:hover { background:#f8fafc; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---- Config (read-only) ----
+# ---- Config ----
 def _clamp(v, lo, hi, default):
     try:
-        v = type(default)(v)
-        return max(lo, min(hi, v))
+        v = type(default)(v); return max(lo, min(hi, v))
     except Exception:
         return default
 
@@ -179,7 +172,6 @@ def _init_state():
     st.session_state.setdefault("logs", [])
     st.session_state.setdefault("proc_logs", [])
     st.session_state.setdefault("delete_target", None)
-    st.session_state.setdefault("dnd_mode", False)
 
 def log(msg: str):
     st.session_state["logs"].append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -508,53 +500,40 @@ def _sanitize_name(name: str) -> str:
         raise ValueError("Неверное имя файла/папки.")
     return name
 
-# -------------------- COMPACT DND MODULE --------------------
+# -------------------- COMPACT DND (in-place) --------------------
 def render_compact_dnd(curr: Path, parent_root: Path):
-    """Минималистичный DnD внутри того же скролл-модуля.
-       Источники: папки + изображения только из текущей директории.
+    """Минималистичный DnD внутри того же 700px-модуля.
+       Источники: папки + изображения в текущей директории.
        Приёмники: каждая подпапка + «Вверх».
     """
     if sort_items is None:
-        st.info("Для перетаскивания установите пакет: `pip install streamlit-sortables`")
+        st.error("DnD требует пакет: pip install streamlit-sortables")
         return
 
     # Источники — только folders + images
     src_items = []
     for p in curr.iterdir():
-        if p.is_dir():
-            src_items.append(str(p))
-        elif p.is_file() and p.suffix.lower() in IMG_EXTS:
+        if p.is_dir() or (p.is_file() and p.suffix.lower() in IMG_EXTS):
             src_items.append(str(p))
 
+    # Приёмники
     subfolders = [p for p in curr.iterdir() if p.is_dir()]
-
-    # Спец-приёмник «Вверх»
     up_label = None
     if curr != parent_root:
         up_disp = curr.parent.name or str(curr.parent)
         up_label = f"⬆️ Вверх ({up_disp})"
 
-    # Строим компактные контейнеры
-    containers = [{"header": "Перетащите элементы отсюда на нужную папку ниже", "items": src_items}]
-    # Вверх — первым приёмником
+    containers = [{"header": "Перетащите элементы на папку-приёмник ниже", "items": src_items}]
     if up_label:
         containers.append({"header": up_label, "items": []})
-    # Подпапки — как строки-приёмники
     for f in subfolders:
         containers.append({"header": f"📁 {f.name}", "items": []})
 
-    # Рендер
     result = sort_items(containers, multi_containers=True, direction="vertical")
-
-    # Визуальные «строки-приёмники»
-    st.caption("Бросайте элементы на строку папки/«Вверх». Перемещаются только папки и фото.")
-    if st.button("Перенести", type="primary", use_container_width=True):
-        # header → папка
-        header_to_dir = {}
+    if st.button("Перенести", key="dnd_apply", type="primary", use_container_width=True):
+        header_to_dir = {f"📁 {f.name}": f for f in subfolders}
         if up_label:
             header_to_dir[up_label] = curr.parent
-        for f in subfolders:
-            header_to_dir[f"📁 {f.name}"] = f
 
         ok = skp = err = 0
         for cont in (result or []):
@@ -567,10 +546,8 @@ def render_compact_dnd(curr: Path, parent_root: Path):
                 try:
                     if not src.exists():
                         skp += 1; continue
-                    # запрет: нельзя класть папку в саму себя/потомка
                     if src.is_dir() and _is_subpath(dst_dir, src):
                         skp += 1; continue
-                    # уже там?
                     if src.parent.resolve() == dst_dir.resolve():
                         skp += 1; continue
                     safe_move(src, dst_dir)
@@ -581,10 +558,9 @@ def render_compact_dnd(curr: Path, parent_root: Path):
         st.success(f"Перемещено: {ok}; пропущено: {skp}; ошибок: {err}")
         st.rerun()
 
-# ---- UI State ----
-._ = _init_state()
+# ---- UI ----
+_init_state()
 
-# ---- Step 1: Pick Folder ----
 st.title("Face Sorter — Мини-проводник")
 
 # LAN URL
@@ -624,20 +600,23 @@ else:
         st.session_state["current_dir"] = str(parent_root)
         curr = parent_root
 
-    top_cols = st.columns([0.08, 0.12, 0.44, 0.18, 0.18])
+    top_cols = st.columns([0.08, 0.12, 0.80])
     with top_cols[0]:
         up = curr.parent if curr != parent_root else None
-        st.button("⬆️ Вверх", key="up", disabled=(up is None),
-                  on_click=(lambda p=str(up): st.session_state.update({"current_dir": p})) if up else None,
-                  use_container_width=True)
+        st.button(
+            "⬆️ Вверх",
+            key="up",
+            disabled=(up is None),
+            on_click=(lambda p=str(up): st.session_state.update({"current_dir": p})) if up else None,
+            use_container_width=True
+        )
     with top_cols[1]:
         if st.button("🔄 Обновить", use_container_width=True):
             st.rerun()
     with top_cols[2]:
-        # Хлебные крошки в пределах root
-        labels, targets = [], []
-        labels.append(parent_root.name if parent_root.name else parent_root.anchor or "/")
-        targets.append(parent_root)
+        # Хлебные крошки только внутри parent_root
+        labels = [parent_root.name if parent_root.name else parent_root.anchor or "/"]
+        targets = [parent_root]
         try:
             rel = curr.resolve().relative_to(parent_root.resolve())
             acc = parent_root
@@ -649,142 +628,144 @@ else:
         bc_cols = st.columns(len(labels))
         for i, (lbl, tgt) in enumerate(zip(labels, targets)):
             with bc_cols[i]:
-                st.button(lbl or "/", key=f"bc::{i}", use_container_width=True,
-                          on_click=(lambda p=str(tgt): st.session_state.update({"current_dir": p})))
-    with top_cols[3]:
-        st.session_state["dnd_mode"] = st.toggle("Режим перетаскивания", value=st.session_state["dnd_mode"])
-    with top_cols[4]:
-        st.caption("DnD: папки+фото → папки/вверх")
+                st.button(
+                    lbl or "/",
+                    key=f"bc::{i}",
+                    use_container_width=True,
+                    on_click=(lambda p=str(tgt): st.session_state.update({"current_dir": p}))
+                )
 
     st.markdown("---")
 
     # Header row
     st.markdown('<div class="row hdr"><div>Превью</div><div>Имя</div><div>Тип</div><div>Изменён</div><div>Размер</div></div>', unsafe_allow_html=True)
 
-    # === Main 700px module (either normal explorer OR compact DnD) ===
+    # === SCROLLABLE explorer (700 px) ===
     with st.container(height=700):
-        if st.session_state["dnd_mode"]:
-            # COMPACT DND inside the same module
-            render_compact_dnd(curr, parent_root)
-        else:
-            # Standard explorer (как было)
-            items = list_dir(curr)
-            for item in items:
-                is_dir = item.is_dir()
-                sel_key = f"sel::{item}"
-                name_btn_key = f"open::{item}"
-                del_key = f"del::{item}"
-                ren_key = f"ren::{item}"
-                ren_input_key = f"ren_input::{item}"
+        # 1) Компактный DnD в этом же модуле
+        render_compact_dnd(curr, parent_root)
+        st.markdown("---")
 
-                c1, c2, c3, c4, c5 = st.columns([0.14, 0.58, 0.12, 0.14, 0.10])
+        # 2) Обычный проводник (просмотр/переименование/удаление/очередь)
+        items = list_dir(curr)
+        for item in items:
+            is_dir = item.is_dir()
+            sel_key = f"sel::{item}"
+            name_btn_key = f"open::{item}"
+            del_key = f"del::{item}"
+            ren_key = f"ren::{item}"
+            ren_input_key = f"ren_input::{item}"
 
-                # Preview
-                with c1:
-                    if not is_dir and item.suffix.lower() in IMG_EXTS:
-                        try:
-                            data = get_thumb_bytes(str(item), 150, item.stat().st_mtime)
-                        except Exception:
-                            data = None
-                        if data:
-                            st.image(data)
-                        else:
-                            st.image(str(item), width=150)
-                    else:
-                        st.markdown('<div class="thumbbox">📁</div>' if is_dir else '<div class="thumbbox">🗎</div>', unsafe_allow_html=True)
+            c1, c2, c3, c4, c5 = st.columns([0.14, 0.58, 0.12, 0.14, 0.10])
 
-                # Name + inline icons
-                with c2:
-                    icon = "📁" if is_dir else "🗎"
-                    name_cols = st.columns([0.72, 0.10, 0.10, 0.08])
-                    with name_cols[0]:
-                        if is_dir:
-                            if st.button(f"{icon} {item.name}", key=name_btn_key, use_container_width=True):
-                                st.session_state["current_dir"] = str(item); st.rerun()
-                        else:
-                            st.write(f"{icon} {item.name}")
-                    with name_cols[1]:
-                        if is_dir:
-                            checked = st.checkbox("Выбрать", key=sel_key,
-                                                  value=(str(item) in st.session_state["selected_dirs"]),
-                                                  help="В очередь", label_visibility="collapsed")
-                            if checked:
-                                st.session_state["selected_dirs"].add(str(item))
-                            else:
-                                st.session_state["selected_dirs"].discard(str(item))
-                    with name_cols[2]:
-                        if st.button("✏️", key=ren_key, help="Переименовать", use_container_width=True):
-                            st.session_state["rename_target"] = str(item)
-                    with name_cols[3]:
-                        if st.button("🗑️", key=del_key, help="Удалить", use_container_width=True):
-                            st.session_state["delete_target"] = str(item)
-
-                with c3:
-                    st.write("Папка" if is_dir else (item.suffix[1:].upper() if item.suffix else "Файл"))
-                with c4:
+            # Preview
+            with c1:
+                if not is_dir and item.suffix.lower() in IMG_EXTS:
                     try:
-                        st.write(datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M"))
+                        data = get_thumb_bytes(str(item), 150, item.stat().st_mtime)
+                    except Exception:
+                        data = None
+                    if data:
+                        st.image(data)
+                    else:
+                        st.image(str(item), width=150)
+                else:
+                    st.markdown('<div class="thumbbox">📁</div>' if is_dir else '<div class="thumbbox">🗎</div>', unsafe_allow_html=True)
+
+            # Name + inline actions
+            with c2:
+                icon = "📁" if is_dir else "🗎"
+                name_cols = st.columns([0.72, 0.10, 0.10, 0.08])
+                with name_cols[0]:
+                    if is_dir:
+                        if st.button(f"{icon} {item.name}", key=name_btn_key, use_container_width=True):
+                            st.session_state["current_dir"] = str(item); st.rerun()
+                    else:
+                        st.write(f"{icon} {item.name}")
+                with name_cols[1]:
+                    if is_dir:
+                        checked = st.checkbox(
+                            "Выбрать", key=sel_key,
+                            value=(str(item) in st.session_state["selected_dirs"]),
+                            help="В очередь", label_visibility="collapsed",
+                        )
+                        if checked:
+                            st.session_state["selected_dirs"].add(str(item))
+                        else:
+                            st.session_state["selected_dirs"].discard(str(item))
+                with name_cols[2]:
+                    if st.button("✏️", key=ren_key, help="Переименовать", use_container_width=True):
+                        st.session_state["rename_target"] = str(item)
+                with name_cols[3]:
+                    if st.button("🗑️", key=del_key, help="Удалить", use_container_width=True):
+                        st.session_state["delete_target"] = str(item)
+
+            with c3:
+                st.write("Папка" if is_dir else (item.suffix[1:].upper() if item.suffix else "Файл"))
+            with c4:
+                try:
+                    st.write(datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M"))
+                except Exception:
+                    st.write("—")
+            with c5:
+                if is_dir:
+                    st.write("—")
+                else:
+                    try:
+                        st.write(human_size(item.stat().st_size))
                     except Exception:
                         st.write("—")
-                with c5:
-                    if is_dir:
-                        st.write("—")
-                    else:
+
+            # Inline rename row
+            if st.session_state.get("rename_target") == str(item):
+                rc1, rc2, rc3 = st.columns([0.70, 0.15, 0.15])
+                with rc1:
+                    new_name_val = st.text_input("Новое имя", value=item.name, key=ren_input_key, label_visibility="collapsed")
+                with rc2:
+                    if st.button("Сохранить", key=f"save::{item}", use_container_width=True):
                         try:
-                            st.write(human_size(item.stat().st_size))
-                        except Exception:
-                            st.write("—")
-
-                # Inline rename row
-                if st.session_state.get("rename_target") == str(item):
-                    rc1, rc2, rc3 = st.columns([0.70, 0.15, 0.15])
-                    with rc1:
-                        new_name_val = st.text_input("Новое имя", value=item.name, key=ren_input_key, label_visibility="collapsed")
-                    with rc2:
-                        if st.button("Сохранить", key=f"save::{item}", use_container_width=True):
-                            try:
-                                new_name = _sanitize_name(new_name_val)
-                                new_path = item.parent / new_name
-                                if new_path.exists():
-                                    st.error("Файл/папка с таким именем уже существует.")
-                                else:
-                                    item.rename(new_path)
-                                    st.session_state["rename_target"] = None
-                                    st.rerun()
-                            except Exception as e:
-                                st.error(f"Ошибка: {e}")
-                    with rc3:
-                        if st.button("Отмена", key=f"cancel::{item}", use_container_width=True):
-                            st.session_state["rename_target"] = None
-                            st.rerun()
-
-                # Inline delete confirm
-                if st.session_state.get("delete_target") == str(item):
-                    dc1, dc2, dc3 = st.columns([0.70, 0.15, 0.15])
-                    with dc1:
-                        st.markdown(f"❗ Подтвердите удаление: **{item.name}**")
-                    with dc2:
-                        if st.button("Удалить", type="primary", key=f"confirm_del::{item}", use_container_width=True):
-                            try:
-                                if send2trash is not None:
-                                    send2trash(str(item))
-                                else:
-                                    if is_dir:
-                                        shutil.rmtree(item, ignore_errors=True)
-                                    else:
-                                        item.unlink(missing_ok=True)
-                                st.session_state["delete_target"] = None
+                            new_name = _sanitize_name(new_name_val)
+                            new_path = item.parent / new_name
+                            if new_path.exists():
+                                st.error("Файл/папка с таким именем уже существует.")
+                            else:
+                                item.rename(new_path)
+                                st.session_state["rename_target"] = None
                                 st.rerun()
-                            except Exception as e:
-                                st.error(f"Ошибка удаления: {e}")
-                                st.session_state["delete_target"] = None
-                    with dc3:
-                        if st.button("Отмена", key=f"cancel_del::{item}", use_container_width=True):
+                        except Exception as e:
+                            st.error(f"Ошибка: {e}")
+                with rc3:
+                    if st.button("Отмена", key=f"cancel::{item}", use_container_width=True):
+                        st.session_state["rename_target"] = None
+                        st.rerun()
+
+            # Inline delete confirm
+            if st.session_state.get("delete_target") == str(item):
+                dc1, dc2, dc3 = st.columns([0.70, 0.15, 0.15])
+                with dc1:
+                    st.markdown(f"❗ Подтвердите удаление: **{item.name}**")
+                with dc2:
+                    if st.button("Удалить", type="primary", key=f"confirm_del::{item}", use_container_width=True):
+                        try:
+                            if send2trash is not None:
+                                send2trash(str(item))
+                            else:
+                                if is_dir:
+                                    shutil.rmtree(item, ignore_errors=True)
+                                else:
+                                    item.unlink(missing_ok=True)
                             st.session_state["delete_target"] = None
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Ошибка удаления: {e}")
+                            st.session_state["delete_target"] = None
+                with dc3:
+                    if st.button("Отмена", key=f"cancel_del::{item}", use_container_width=True):
+                        st.session_state["delete_target"] = None
 
     st.markdown("---")
 
-    # Footer actions (без изменений)
+    # Footer actions
     colA, colB, colC = st.columns([0.35, 0.35, 0.30])
     with colA:
         if st.button("➕ Добавить в очередь", type="secondary", use_container_width=True):
