@@ -1,7 +1,7 @@
 # app.py
-# Minimal Explorer (revised++++): LAN URL, cached thumbnails, safe delete/copy/move,
-# atomic JSON writes, UI fixes, root-safe "Up", progress bar inside status,
-# scrollable explorer (700px), and IN-PLACE Drag&Drop move (Windows-like targets).
+# Explorer (compact DnD): LAN URL, cached thumbnails, safe ops, sandboxed nav,
+# atomic JSON writes, progress-in-status, scrollable explorer (700px),
+# and COMPACT "D&D mode" inside the same module (folders + photos only).
 
 import json
 import shutil
@@ -14,7 +14,7 @@ from datetime import datetime
 
 import streamlit as st
 
-# Optional: Drag&Drop lists
+# Optional: compact DnD based on SortableJS
 try:
     from streamlit_sortables import sort_items  # pip install streamlit-sortables
 except Exception:
@@ -52,11 +52,7 @@ except Exception:
             "cluster_images": {},
             "group_only_images": [],
             "unknown_images": [],
-            "stats": {
-                "images_total": 0,
-                "images_unknown_only": 0,
-                "images_group_only": 0
-            }
+            "stats": {"images_total": 0, "images_unknown_only": 0, "images_group_only": 0}
         }
 
 # Optional PIL for exact 150x150 thumbnails
@@ -73,17 +69,24 @@ st.markdown("""
   .row { display:grid; grid-template-columns: 160px 1fr 110px 170px 120px; gap:8px; align-items:center; padding:6px 8px; border-bottom:1px solid #f1f5f9;}
   .row:hover { background:#f8fafc; }
   .hdr { font-weight:600; color:#334155; border-bottom:1px solid #e2e8f0; }
-  .name { display:flex; align-items:center; gap:8px; }
-  .iconbtn { border:1px solid #e5e7eb; background:#fff; border-radius:8px; padding:4px 6px; cursor:pointer; }
-  .iconbtn:hover { background:#f1f5f9; }
+  .thumbbox { width:150px; height:150px; display:flex; align-items:center; justify-content:center; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden; background:#fff; }
   .muted { color:#64748b; font-size:12px; }
-  .addr { display:flex; gap:8px; align-items:center; }
   .crumb { border:1px solid transparent; padding:4px 8px; border-radius:8px; }
   .crumb:hover { background:#f1f5f9; border-color:#e5e7eb; }
-  .thumbbox { width:150px; height:150px; display:flex; align-items:center; justify-content:center; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden; background:#fff; }
-  /* Compact tweaks for sortables block to look native */
-  div[data-testid="stSortables"] ul { margin: 4px 0 !important; }
-  div[data-testid="stSortables"] li { padding: 6px 8px !important; border:1px dashed #e5e7eb; border-radius:8px; }
+
+  /* Compact DnD styling — делает контейнеры похожими на строки */
+  div[data-testid="stSortables"] > div > h3 { display:none; } /* прячем заголовок блока */
+  div[data-testid="stSortables"] ul { margin:0 !important; padding:0 !important; }
+  div[data-testid="stSortables"] li {
+      list-style:none; margin:0 0 2px 0 !important; padding:6px 8px !important;
+      border:1px dashed #e5e7eb; border-radius:8px; background:#fff;
+      display:flex; align-items:center; gap:8px;
+  }
+  /* «приёмники» для папок — компактные строки */
+  .dnd-target { display:grid; grid-template-columns: 160px 1fr 110px 170px 120px;
+                gap:8px; align-items:center; padding:6px 8px; border:1px dashed #e5e7eb;
+                border-radius:10px; background:#fcfcfd; }
+  .dnd-target:hover { background:#f8fafc; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -98,18 +101,10 @@ def _clamp(v, lo, hi, default):
 def load_config(base: Path) -> Dict:
     p = base / "config.json"
     defaults = {
-        "group_thr": 3,
-        "eps_sim": 0.55,
-        "min_samples": 2,
-        "min_face": 110,
-        "blur_thr": 45.0,
-        "det_size": 640,
-        "gpu_id": 0,
-        "match_thr": 0.52,
-        "top2_margin": 0.08,
-        "per_person_min_obs": 10,
-        "min_det_score": 0.50,
-        "min_quality": 0.50
+        "group_thr": 3, "eps_sim": 0.55, "min_samples": 2, "min_face": 110,
+        "blur_thr": 45.0, "det_size": 640, "gpu_id": 0,
+        "match_thr": 0.52, "top2_margin": 0.08,
+        "per_person_min_obs": 10, "min_det_score": 0.50, "min_quality": 0.50
     }
     if p.exists():
         try:
@@ -118,7 +113,6 @@ def load_config(base: Path) -> Dict:
                 defaults.update({k: user_cfg[k] for k in user_cfg})
         except Exception:
             pass
-
     defaults["eps_sim"] = _clamp(defaults["eps_sim"], 0.0, 1.0, 0.55)
     defaults["match_thr"] = _clamp(defaults["match_thr"], 0.0, 1.0, 0.52)
     defaults["top2_margin"] = _clamp(defaults["top2_margin"], 0.0, 1.0, 0.08)
@@ -129,7 +123,7 @@ def load_config(base: Path) -> Dict:
 CFG_BASE = Path(__file__).parent
 CFG = load_config(CFG_BASE)
 
-# ---- Persistence for global stats ----
+# ---- Persistence ----
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -141,11 +135,9 @@ def load_index(parent: Path) -> Dict:
             return json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {
-        "group_counts": {},
-        "global_stats": {"images_total": 0, "images_unknown_only": 0, "images_group_only": 0},
-        "last_run": None
-    }
+    return {"group_counts": {},
+            "global_stats": {"images_total": 0, "images_unknown_only": 0, "images_group_only": 0},
+            "last_run": None}
 
 def _atomic_write(path: Path, text: str):
     ensure_dir(path.parent)
@@ -158,7 +150,7 @@ def save_index(parent: Path, idx: Dict):
     idx["last_run"] = datetime.now().isoformat(timespec="seconds")
     _atomic_write(parent / "global_index.json", json.dumps(idx, ensure_ascii=False, indent=2))
 
-# ---- Network URL helpers ----
+# ---- Network URL ----
 def get_lan_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -187,6 +179,7 @@ def _init_state():
     st.session_state.setdefault("logs", [])
     st.session_state.setdefault("proc_logs", [])
     st.session_state.setdefault("delete_target", None)
+    st.session_state.setdefault("dnd_mode", False)
 
 def log(msg: str):
     st.session_state["logs"].append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -215,7 +208,6 @@ def load_person_index(group_dir: Path) -> Dict:
             data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             return data
-
     persons = data.get("persons", [])
     changed = False
     for person in persons:
@@ -223,10 +215,9 @@ def load_person_index(group_dir: Path) -> Dict:
             if "proto" in person:
                 v = person.pop("proto")
                 person["protos"] = [v]
-                changed = True
             else:
                 person["protos"] = []
-                changed = True
+            changed = True
         if "ema" not in person:
             person["ema"] = person["protos"][0] if person["protos"] else None
             changed = True
@@ -236,16 +227,12 @@ def load_person_index(group_dir: Path) -> Dict:
         if "thr" not in person:
             person["thr"] = None
             changed = True
-
     if changed:
         try:
-            _atomic_write(
-                group_dir / "person_index.json",
-                json.dumps({"persons": persons}, ensure_ascii=False, indent=2),
-            )
+            _atomic_write(group_dir / "person_index.json",
+                          json.dumps({"persons": persons}, ensure_ascii=False, indent=2))
         except Exception:
             pass
-
     return {"persons": persons}
 
 def save_person_index(group_dir: Path, data: Dict):
@@ -260,7 +247,6 @@ def _is_subpath(p: Path, root: Path) -> bool:
 def cleanup_processed_images(group_dir: Path, processed_images: Set[Path]):
     protected_roots = {group_dir / "__unknown__", group_dir / "__group_only__"}
     protected_roots |= {d for d in group_dir.iterdir() if d.is_dir() and d.name.isdigit()}
-
     for img_path in list(processed_images):
         try:
             if img_path.is_symlink():
@@ -280,21 +266,16 @@ def _normalize_np(v):
     return (arr / n).astype(np.float32)
 
 def _update_person_proto(person: Dict, new_vec, k_max: int = 5, ema_alpha: float = 0.9):
-    """
-    Обновление прототипов без зацикливаний: Farthest Point Sampling с маской.
-    """
     import numpy as np
     nv = _normalize_np(new_vec).tolist()
     protos = person.get("protos", [])
     protos.append(nv)
-
     if len(protos) > k_max:
-        X = np.stack([_normalize_np(v) for v in protos], axis=0)  # [n, d]
+        X = np.stack([_normalize_np(v) for v in protos], axis=0)
         d0 = np.linalg.norm(X - X.mean(0), axis=1)
         keep = [int(np.argmax(d0))]
-
         while len(keep) < k_max and len(keep) < len(X):
-            sims = X @ X[keep].T  # [n, |keep|]
+            sims = X @ X[keep].T
             dists = 1.0 - np.max(sims, axis=1)
             for idx in keep:
                 dists[idx] = -np.inf
@@ -302,21 +283,17 @@ def _update_person_proto(person: Dict, new_vec, k_max: int = 5, ema_alpha: float
             if dists[cand] == -np.inf:
                 break
             keep.append(cand)
-
         if len(keep) < min(k_max, len(X)):
             for i in range(len(X)):
                 if i not in keep:
                     keep.append(i)
                 if len(keep) >= min(k_max, len(X)):
                     break
-
         protos = [X[i].tolist() for i in keep]
-
     ema = person.get("ema")
     ema_np = _normalize_np(ema if ema is not None else protos[0])
     ema_np = ema_alpha * ema_np + (1.0 - ema_alpha) * _normalize_np(new_vec)
     ema_np = _normalize_np(ema_np)
-
     person["protos"] = protos
     person["ema"] = ema_np.tolist()
     person["count"] = int(person.get("count", 0)) + 1
@@ -347,9 +324,7 @@ def safe_move(src: Path, dst_dir: Path) -> Path:
 
 def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int, Set[Path]]:
     import numpy as np
-
     top2_margin = float(CFG.get("top2_margin", 0.08))
-
     person_idx = load_person_index(group_dir)
     persons = person_idx.get("persons", [])
 
@@ -381,42 +356,37 @@ def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int,
             proto_list.append(_normalize_np(v))
             proto_owner.append(num)
 
+    P = None
     if len(proto_list) > 0:
+        import numpy as np
         P = np.stack(proto_list, axis=0)
-    else:
-        P = None
 
     assigned: Dict[int, int] = {}
     new_nums: Dict[int, int] = {}
 
     existing_nums = sorted([int(d.name) for d in group_dir.iterdir() if d.is_dir() and d.name.isdigit()])
     cur_max = existing_nums[-1] if existing_nums else 0
-
     eligible = [int(c) if str(c).isdigit() else c for c in plan.get("eligible_clusters", [])]
 
     for cid in eligible:
         c = centroids_norm.get(cid)
         if c is None:
             continue
-
         if P is not None and len(P) > 0:
-            sims = (P @ c.astype(np.float32))
+            sims = (P @ c.astype("float32"))
+            import numpy as np
             sims = np.nan_to_num(sims, nan=-1.0)
-
             per_person_scores: Dict[int, float] = {}
             for s, owner in zip(sims.tolist(), proto_owner):
                 if owner not in per_person_scores or s > per_person_scores[owner]:
                     per_person_scores[owner] = s
-
             if not per_person_scores:
                 best_num = None; s1 = -1.0; s2 = -1.0
             else:
                 sorted_pairs = sorted(per_person_scores.items(), key=lambda x: x[1], reverse=True)
                 best_num, s1 = sorted_pairs[0]
                 s2 = sorted_pairs[1][1] if len(sorted_pairs) > 1 else -1.0
-
             thr_use = max(float(match_thr), float(per_thr.get(best_num, -1e9))) if best_num is not None else float(match_thr)
-
             if (best_num is not None) and (s1 >= thr_use) and (s1 - s2 >= top2_margin):
                 assigned[cid] = int(best_num)
                 for p in persons:
@@ -426,23 +396,11 @@ def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int,
             else:
                 cur_max += 1
                 new_nums[cid] = cur_max
-                persons.append({
-                    "number": cur_max,
-                    "protos": [c.tolist()],
-                    "ema": c.tolist(),
-                    "count": 1,
-                    "thr": None
-                })
+                persons.append({"number": cur_max, "protos": [c.tolist()], "ema": c.tolist(), "count": 1, "thr": None})
         else:
             cur_max += 1
             new_nums[cid] = cur_max
-            persons.append({
-                "number": cur_max,
-                "protos": [c.tolist()],
-                "ema": c.tolist(),
-                "count": 1,
-                "thr": None
-            })
+            persons.append({"number": cur_max, "protos": [c.tolist()], "ema": c.tolist(), "count": 1, "thr": None})
 
     for cid, num in {**assigned, **new_nums}.items():
         ensure_dir(group_dir / str(num))
@@ -505,7 +463,6 @@ def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int,
     for img in un:
         processed_images.add(Path(img))
 
-    # Без followlinks
     def _iter_image_files(root: Path, exts: Set[str]):
         exts = {e.lower() for e in exts}
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -515,7 +472,6 @@ def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int,
 
     all_in_group = set(_iter_image_files(group_dir, IMG_EXTS))
     processed_images = processed_images.intersection(all_in_group)
-
     return len(persons), processed_images
 
 def make_square_thumb(img_path: Path, size: int = 150):
@@ -546,17 +502,87 @@ def get_thumb_bytes(path_str: str, size: int, mtime: float):
     return buf.getvalue()
 
 def _sanitize_name(name: str) -> str:
-    """
-    Жёсткая валидация имени для переименования — без перемещения и кривых символов.
-    """
     bad = {'/', '\\', ':', '*', '?', '"', '<', '>', '|'}
     name = (name or "").strip()
     if not name or any(ch in name for ch in bad) or name in {'.', '..'}:
         raise ValueError("Неверное имя файла/папки.")
     return name
 
+# -------------------- COMPACT DND MODULE --------------------
+def render_compact_dnd(curr: Path, parent_root: Path):
+    """Минималистичный DnD внутри того же скролл-модуля.
+       Источники: папки + изображения только из текущей директории.
+       Приёмники: каждая подпапка + «Вверх».
+    """
+    if sort_items is None:
+        st.info("Для перетаскивания установите пакет: `pip install streamlit-sortables`")
+        return
+
+    # Источники — только folders + images
+    src_items = []
+    for p in curr.iterdir():
+        if p.is_dir():
+            src_items.append(str(p))
+        elif p.is_file() and p.suffix.lower() in IMG_EXTS:
+            src_items.append(str(p))
+
+    subfolders = [p for p in curr.iterdir() if p.is_dir()]
+
+    # Спец-приёмник «Вверх»
+    up_label = None
+    if curr != parent_root:
+        up_disp = curr.parent.name or str(curr.parent)
+        up_label = f"⬆️ Вверх ({up_disp})"
+
+    # Строим компактные контейнеры
+    containers = [{"header": "Перетащите элементы отсюда на нужную папку ниже", "items": src_items}]
+    # Вверх — первым приёмником
+    if up_label:
+        containers.append({"header": up_label, "items": []})
+    # Подпапки — как строки-приёмники
+    for f in subfolders:
+        containers.append({"header": f"📁 {f.name}", "items": []})
+
+    # Рендер
+    result = sort_items(containers, multi_containers=True, direction="vertical")
+
+    # Визуальные «строки-приёмники»
+    st.caption("Бросайте элементы на строку папки/«Вверх». Перемещаются только папки и фото.")
+    if st.button("Перенести", type="primary", use_container_width=True):
+        # header → папка
+        header_to_dir = {}
+        if up_label:
+            header_to_dir[up_label] = curr.parent
+        for f in subfolders:
+            header_to_dir[f"📁 {f.name}"] = f
+
+        ok = skp = err = 0
+        for cont in (result or []):
+            header = cont.get("header", "")
+            dst_dir = header_to_dir.get(header)
+            if not dst_dir:
+                continue
+            for src_str in cont.get("items", []):
+                src = Path(src_str)
+                try:
+                    if not src.exists():
+                        skp += 1; continue
+                    # запрет: нельзя класть папку в саму себя/потомка
+                    if src.is_dir() and _is_subpath(dst_dir, src):
+                        skp += 1; continue
+                    # уже там?
+                    if src.parent.resolve() == dst_dir.resolve():
+                        skp += 1; continue
+                    safe_move(src, dst_dir)
+                    ok += 1
+                except Exception as e:
+                    err += 1
+                    st.error(f"Не удалось переместить {src.name}: {e}")
+        st.success(f"Перемещено: {ok}; пропущено: {skp}; ошибок: {err}")
+        st.rerun()
+
 # ---- UI State ----
-_init_state()
+._ = _init_state()
 
 # ---- Step 1: Pick Folder ----
 st.title("Face Sorter — Мини-проводник")
@@ -598,252 +624,178 @@ else:
         st.session_state["current_dir"] = str(parent_root)
         curr = parent_root
 
-    top_cols = st.columns([0.08, 0.12, 0.80])
+    top_cols = st.columns([0.08, 0.12, 0.44, 0.18, 0.18])
     with top_cols[0]:
         up = curr.parent if curr != parent_root else None
-        st.button(
-            "⬆️ Вверх",
-            key="up",
-            disabled=(up is None),
-            on_click=(lambda p=str(up): st.session_state.update({"current_dir": p})) if up else None,
-            use_container_width=True
-        )
+        st.button("⬆️ Вверх", key="up", disabled=(up is None),
+                  on_click=(lambda p=str(up): st.session_state.update({"current_dir": p})) if up else None,
+                  use_container_width=True)
     with top_cols[1]:
         if st.button("🔄 Обновить", use_container_width=True):
             st.rerun()
     with top_cols[2]:
-        # Хлебные крошки только внутри parent_root
-        labels = []
-        targets = []
-
+        # Хлебные крошки в пределах root
+        labels, targets = [], []
         labels.append(parent_root.name if parent_root.name else parent_root.anchor or "/")
         targets.append(parent_root)
-
         try:
             rel = curr.resolve().relative_to(parent_root.resolve())
             acc = parent_root
             for part in rel.parts:
                 acc = acc / part
-                labels.append(part)
-                targets.append(acc)
+                labels.append(part); targets.append(acc)
         except Exception:
-            # В случае сбоя — только root
             pass
-
         bc_cols = st.columns(len(labels))
         for i, (lbl, tgt) in enumerate(zip(labels, targets)):
             with bc_cols[i]:
-                st.button(
-                    lbl or "/",
-                    key=f"bc::{i}",
-                    use_container_width=True,
-                    on_click=(lambda p=str(tgt): st.session_state.update({"current_dir": p}))
-                )
+                st.button(lbl or "/", key=f"bc::{i}", use_container_width=True,
+                          on_click=(lambda p=str(tgt): st.session_state.update({"current_dir": p})))
+    with top_cols[3]:
+        st.session_state["dnd_mode"] = st.toggle("Режим перетаскивания", value=st.session_state["dnd_mode"])
+    with top_cols[4]:
+        st.caption("DnD: папки+фото → папки/вверх")
 
     st.markdown("---")
 
     # Header row
     st.markdown('<div class="row hdr"><div>Превью</div><div>Имя</div><div>Тип</div><div>Изменён</div><div>Размер</div></div>', unsafe_allow_html=True)
 
-    # === SCROLLABLE explorer (700 px) ===
+    # === Main 700px module (either normal explorer OR compact DnD) ===
     with st.container(height=700):
-        items = list_dir(curr)
-        for item in items:
-            is_dir = item.is_dir()
-            sel_key = f"sel::{item}"
-            name_btn_key = f"open::{item}"
-            del_key = f"del::{item}"
-            ren_key = f"ren::{item}"
-            ren_input_key = f"ren_input::{item}"
+        if st.session_state["dnd_mode"]:
+            # COMPACT DND inside the same module
+            render_compact_dnd(curr, parent_root)
+        else:
+            # Standard explorer (как было)
+            items = list_dir(curr)
+            for item in items:
+                is_dir = item.is_dir()
+                sel_key = f"sel::{item}"
+                name_btn_key = f"open::{item}"
+                del_key = f"del::{item}"
+                ren_key = f"ren::{item}"
+                ren_input_key = f"ren_input::{item}"
 
-            c1, c2, c3, c4, c5 = st.columns([0.14, 0.58, 0.12, 0.14, 0.10])
+                c1, c2, c3, c4, c5 = st.columns([0.14, 0.58, 0.12, 0.14, 0.10])
 
-            # Preview
-            with c1:
-                if not is_dir and item.suffix.lower() in IMG_EXTS:
-                    try:
-                        data = get_thumb_bytes(str(item), 150, item.stat().st_mtime)
-                    except Exception:
-                        data = None
-                    if data:
-                        st.image(data)
-                    else:
-                        st.image(str(item), width=150)
-                else:
-                    st.markdown('<div class="thumbbox">📁</div>' if is_dir else '<div class="thumbbox">🗎</div>', unsafe_allow_html=True)
-
-            # Name + inline icons
-            with c2:
-                icon = "📁" if is_dir else "🗎"
-                name_cols = st.columns([0.72, 0.10, 0.10, 0.08])
-                with name_cols[0]:
-                    if is_dir:
-                        if st.button(f"{icon} {item.name}", key=name_btn_key, use_container_width=True):
-                            st.session_state["current_dir"] = str(item)
-                            st.rerun()
-                    else:
-                        st.write(f"{icon} {item.name}")
-                with name_cols[1]:
-                    if is_dir:
-                        checked = st.checkbox(
-                            "Выбрать",
-                            key=sel_key,
-                            value=(str(item) in st.session_state["selected_dirs"]),
-                            help="В очередь",
-                            label_visibility="collapsed",
-                        )
-                        if checked:
-                            st.session_state["selected_dirs"].add(str(item))
+                # Preview
+                with c1:
+                    if not is_dir and item.suffix.lower() in IMG_EXTS:
+                        try:
+                            data = get_thumb_bytes(str(item), 150, item.stat().st_mtime)
+                        except Exception:
+                            data = None
+                        if data:
+                            st.image(data)
                         else:
-                            st.session_state["selected_dirs"].discard(str(item))
-                with name_cols[2]:
-                    if st.button("✏️", key=ren_key, help="Переименовать", use_container_width=True):
-                        st.session_state["rename_target"] = str(item)
-                with name_cols[3]:
-                    if st.button("🗑️", key=del_key, help="Удалить", use_container_width=True):
-                        st.session_state["delete_target"] = str(item)
+                            st.image(str(item), width=150)
+                    else:
+                        st.markdown('<div class="thumbbox">📁</div>' if is_dir else '<div class="thumbbox">🗎</div>', unsafe_allow_html=True)
 
-            with c3:
-                st.write("Папка" if is_dir else (item.suffix[1:].upper() if item.suffix else "Файл"))
-            with c4:
-                try:
-                    st.write(datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M"))
-                except Exception:
-                    st.write("—")
-            with c5:
-                if is_dir:
-                    st.write("—")
-                else:
+                # Name + inline icons
+                with c2:
+                    icon = "📁" if is_dir else "🗎"
+                    name_cols = st.columns([0.72, 0.10, 0.10, 0.08])
+                    with name_cols[0]:
+                        if is_dir:
+                            if st.button(f"{icon} {item.name}", key=name_btn_key, use_container_width=True):
+                                st.session_state["current_dir"] = str(item); st.rerun()
+                        else:
+                            st.write(f"{icon} {item.name}")
+                    with name_cols[1]:
+                        if is_dir:
+                            checked = st.checkbox("Выбрать", key=sel_key,
+                                                  value=(str(item) in st.session_state["selected_dirs"]),
+                                                  help="В очередь", label_visibility="collapsed")
+                            if checked:
+                                st.session_state["selected_dirs"].add(str(item))
+                            else:
+                                st.session_state["selected_dirs"].discard(str(item))
+                    with name_cols[2]:
+                        if st.button("✏️", key=ren_key, help="Переименовать", use_container_width=True):
+                            st.session_state["rename_target"] = str(item)
+                    with name_cols[3]:
+                        if st.button("🗑️", key=del_key, help="Удалить", use_container_width=True):
+                            st.session_state["delete_target"] = str(item)
+
+                with c3:
+                    st.write("Папка" if is_dir else (item.suffix[1:].upper() if item.suffix else "Файл"))
+                with c4:
                     try:
-                        st.write(human_size(item.stat().st_size))
+                        st.write(datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M"))
                     except Exception:
                         st.write("—")
-
-            # Inline rename row
-            if st.session_state.get("rename_target") == str(item):
-                rc1, rc2, rc3 = st.columns([0.70, 0.15, 0.15])
-                with rc1:
-                    new_name_val = st.text_input("Новое имя", value=item.name, key=ren_input_key, label_visibility="collapsed")
-                with rc2:
-                    if st.button("Сохранить", key=f"save::{item}", use_container_width=True):
+                with c5:
+                    if is_dir:
+                        st.write("—")
+                    else:
                         try:
-                            new_name = _sanitize_name(new_name_val)
-                            new_path = item.parent / new_name
-                            if new_path.exists():
-                                st.error("Файл/папка с таким именем уже существует.")
-                            else:
-                                item.rename(new_path)
-                                st.session_state["rename_target"] = None
-                                st.rerun()
-                        except Exception as e:
-                            st.error(f"Ошибка: {e}")
-                with rc3:
-                    if st.button("Отмена", key=f"cancel::{item}", use_container_width=True):
-                        st.session_state["rename_target"] = None
-                        st.rerun()
+                            st.write(human_size(item.stat().st_size))
+                        except Exception:
+                            st.write("—")
 
-            # Inline delete confirm
-            if st.session_state.get("delete_target") == str(item):
-                dc1, dc2, dc3 = st.columns([0.70, 0.15, 0.15])
-                with dc1:
-                    st.markdown(f"❗ Подтвердите удаление: **{item.name}**")
-                with dc2:
-                    if st.button("Удалить", type="primary", key=f"confirm_del::{item}", use_container_width=True):
-                        try:
-                            if send2trash is not None:
-                                send2trash(str(item))
-                            else:
-                                if is_dir:
-                                    shutil.rmtree(item, ignore_errors=True)
+                # Inline rename row
+                if st.session_state.get("rename_target") == str(item):
+                    rc1, rc2, rc3 = st.columns([0.70, 0.15, 0.15])
+                    with rc1:
+                        new_name_val = st.text_input("Новое имя", value=item.name, key=ren_input_key, label_visibility="collapsed")
+                    with rc2:
+                        if st.button("Сохранить", key=f"save::{item}", use_container_width=True):
+                            try:
+                                new_name = _sanitize_name(new_name_val)
+                                new_path = item.parent / new_name
+                                if new_path.exists():
+                                    st.error("Файл/папка с таким именем уже существует.")
                                 else:
-                                    item.unlink(missing_ok=True)
-                            st.session_state["delete_target"] = None
+                                    item.rename(new_path)
+                                    st.session_state["rename_target"] = None
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Ошибка: {e}")
+                    with rc3:
+                        if st.button("Отмена", key=f"cancel::{item}", use_container_width=True):
+                            st.session_state["rename_target"] = None
                             st.rerun()
-                        except Exception as e:
-                            st.error(f"Ошибка удаления: {e}")
+
+                # Inline delete confirm
+                if st.session_state.get("delete_target") == str(item):
+                    dc1, dc2, dc3 = st.columns([0.70, 0.15, 0.15])
+                    with dc1:
+                        st.markdown(f"❗ Подтвердите удаление: **{item.name}**")
+                    with dc2:
+                        if st.button("Удалить", type="primary", key=f"confirm_del::{item}", use_container_width=True):
+                            try:
+                                if send2trash is not None:
+                                    send2trash(str(item))
+                                else:
+                                    if is_dir:
+                                        shutil.rmtree(item, ignore_errors=True)
+                                    else:
+                                        item.unlink(missing_ok=True)
+                                st.session_state["delete_target"] = None
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Ошибка удаления: {e}")
+                                st.session_state["delete_target"] = None
+                    with dc3:
+                        if st.button("Отмена", key=f"cancel_del::{item}", use_container_width=True):
                             st.session_state["delete_target"] = None
-                with dc3:
-                    if st.button("Отмена", key=f"cancel_del::{item}", use_container_width=True):
-                        st.session_state["delete_target"] = None
-
-    # === IN-PLACE Drag & Drop (как в проводнике): контейнеры-приёмники — подпапки + «Вверх» ===
-    st.markdown("##### Перетаскивание (Drag & Drop)")
-    if sort_items is None:
-        st.info("Для перетаскивания установите пакет: `pip install streamlit-sortables`")
-    else:
-        # Источники: все элементы (файлы/папки) текущей директории
-        items_in_curr = [str(p) for p in curr.iterdir() if p.is_file() or p.is_dir()]
-        # Приёмники: каждая подпапка + «Вверх»
-        subfolders = [p for p in curr.iterdir() if p.is_dir()]
-
-        up_label = None
-        if curr != parent_root:
-            up_disp = curr.parent.name or str(curr.parent)
-            up_label = f"⬆️ Вверх ({up_disp})"
-
-        containers = [{"header": "Текущая папка", "items": items_in_curr}]
-        for f in subfolders:
-            containers.append({"header": f"📁 {f.name}", "items": []})
-        if up_label:
-            containers.append({"header": up_label, "items": []})
-
-        result = sort_items(containers, multi_containers=True)
-
-        if st.button("Применить переносы", use_container_width=True):
-            header_to_dir = {f"📁 {f.name}": f for f in subfolders}
-            if up_label:
-                header_to_dir[up_label] = curr.parent
-
-            ok = skp = err = 0
-            for cont in (result or []):
-                header = cont.get("header", "")
-                dst_dir = header_to_dir.get(header)
-                if not dst_dir:
-                    continue  # «Текущая папка» — не приёмник
-
-                for src_str in cont.get("items", []):
-                    src = Path(src_str)
-                    try:
-                        if not src.exists():
-                            skp += 1
-                            continue
-
-                        # Запрет: нельзя перемещать папку внутрь самой себя/потомка
-                        if src.is_dir() and _is_subpath(dst_dir, src):
-                            st.warning(f"Нельзя переместить «{src.name}» внутрь самого себя/потомка.")
-                            skp += 1
-                            continue
-
-                        # Если уже лежит в целевом каталоге — скип
-                        if src.parent.resolve() == dst_dir.resolve():
-                            skp += 1
-                            continue
-
-                        safe_move(src, dst_dir)
-                        ok += 1
-                    except Exception as e:
-                        err += 1
-                        st.error(f"Не удалось переместить {src.name}: {e}")
-
-            st.success(f"Перемещено: {ok}; пропущено: {skp}; ошибок: {err}")
-            st.rerun()
 
     st.markdown("---")
 
-    # Footer actions
+    # Footer actions (без изменений)
     colA, colB, colC = st.columns([0.35, 0.35, 0.30])
     with colA:
         if st.button("➕ Добавить в очередь", type="secondary", use_container_width=True):
             added = 0
             for d in list(st.session_state["selected_dirs"]):
                 if d not in st.session_state["queue"]:
-                    st.session_state["queue"].append(d)
-                    added += 1
+                    st.session_state["queue"].append(d); added += 1
             st.success(f"Добавлено в очередь: {added}")
     with colB:
         if st.button("🧹 Очистить очередь", use_container_width=True):
-            st.session_state["queue"] = []
-            st.session_state["selected_dirs"] = set()
+            st.session_state["queue"] = []; st.session_state["selected_dirs"] = set()
             st.info("Очередь очищена.")
     with colC:
         st.write(f"В очереди: {len(st.session_state['queue'])}")
@@ -871,13 +823,8 @@ else:
                     try:
                         plan = build_plan(
                             gdir,
-                            group_thr=CFG["group_thr"],
-                            eps_sim=CFG["eps_sim"],
-                            min_samples=CFG["min_samples"],
-                            min_face=CFG["min_face"],
-                            blur_thr=CFG["blur_thr"],
-                            det_size=CFG["det_size"],
-                            gpu_id=CFG["gpu_id"],
+                            group_thr=CFG["group_thr"], eps_sim=CFG["eps_sim"], min_samples=CFG["min_samples"],
+                            min_face=CFG["min_face"], blur_thr=CFG["blur_thr"], det_size=CFG["det_size"], gpu_id=CFG["gpu_id"],
                         )
                         cluster_images = plan.get("cluster_images", {}) or {}
                         faces_detections = sum(len(v) for v in cluster_images.values())
