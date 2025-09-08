@@ -101,7 +101,7 @@ def load_config(base: Path) -> Dict:
         "blur_thr": 45.0,
         "det_size": 640,
         "gpu_id": 0,
-        "match_thr": 0.50,
+        "match_thr": 0.44,
         "top2_margin": 0.08,
         "per_person_min_obs": 10,
         "min_det_score": 0.50,
