@@ -95,17 +95,17 @@ def load_config(base: Path) -> Dict:
     p = base / "config.json"
     defaults = {
         "group_thr": 3,
-        "eps_sim": 0.55,
+        "eps_sim": 0.72,
         "min_samples": 2,
-        "min_face": 110,
-        "blur_thr": 45.0,
-        "det_size": 640,
+        "min_face": 60,
+        "blur_thr": 60.0,
+        "det_size": 1024,
         "gpu_id": 0,
-        "match_thr": 0.44,
-        "top2_margin": 0.08,
-        "per_person_min_obs": 10,
-        "min_det_score": 0.50,
-        "min_quality": 0.50
+        "match_thr": 0.62,
+        "top2_margin": 0.12,
+        "per_person_min_obs": 20,
+        "min_det_score": 0.70,
+        "min_quality": 0.70
     }
     if p.exists():
         try:
