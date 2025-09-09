@@ -1,13 +1,22 @@
-# app.py — patched
+# app.py — patched (2025-09-09)
 # Minimal Explorer (revised++++): LAN URL, cached thumbnails (bounded), safe delete/copy/move,
 # atomic JSON writes, UI fixes, root-safe "Up", progress bar inside status,
 # scrollable explorer (700px), Drag&Drop move panel, configurable originals cleanup,
 # robust person_index compatibility, case-insensitive image scan, breadcrumbs truncation,
 # safe rename, basic filters, run report + downloads, config validation warnings.
+# +++++ YOLO FIXES +++++
+# - Stable weights cache in ~/.cache/ultralytics/weights
+# - Cached model keyed by (model_name, device, half, imgsz) + warmup
+# - Predict with timeout to avoid UI freeze
+# - Device/half/imgsz respected end-to-end
+# - Diagnostics logging
+# - Default to yolov8x.pt (max accuracy)
 
 import json
 import shutil
 import socket
+import os
+import concurrent.futures
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Tuple, Set
@@ -62,9 +71,11 @@ except Exception:
 
 # Optional PIL for exact 150x150 thumbnails
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
+    Image.MAX_IMAGE_PIXELS = 200_000_000  # защита от декомпресс.-бомб
 except Exception:
     Image = None
+    ImageOps = None
 
 # Optional Ultralytics YOLO for person detection
 try:
@@ -98,14 +109,17 @@ ALLOWED_CFG_KEYS = {
     "delete_originals"
 }
 
-def _clamp(v, lo, hi, default):
+def _clamp_with_warn(key, val, lo, hi, default, warns: list):
     try:
-        v = type(default)(v)
-        return max(lo, min(hi, v))
+        v = type(default)(val)
     except Exception:
+        warns.append(f"{key}: некорректное значение, применено по умолчанию {default}")
         return default
+    if v < lo or v > hi:
+        warns.append(f"{key}: {v} вне диапазона [{lo}, {hi}], скорректировано")
+    return max(lo, min(hi, v))
 
-def load_config(base: Path) -> Dict:
+def load_config(base: Path) -> Tuple[Dict, List[str]]:
     p = base / "config.json"
     defaults = {
         "group_thr": 3,
@@ -134,16 +148,17 @@ def load_config(base: Path) -> Dict:
         except Exception:
             pass
 
-    defaults["eps_sim"] = _clamp(defaults["eps_sim"], 0.0, 1.0, 0.55)
-    defaults["match_thr"] = _clamp(defaults["match_thr"], 0.0, 1.0, 0.44)
-    defaults["top2_margin"] = _clamp(defaults["top2_margin"], 0.0, 1.0, 0.08)
-    defaults["min_face"] = _clamp(defaults["min_face"], 0, 10000, 110)
-    defaults["det_size"] = _clamp(defaults["det_size"], 64, 4096, 640)
+    warns = []
+    defaults["eps_sim"] = _clamp_with_warn("eps_sim", defaults["eps_sim"], 0.0, 1.0, 0.55, warns)
+    defaults["match_thr"] = _clamp_with_warn("match_thr", defaults["match_thr"], 0.0, 1.0, 0.44, warns)
+    defaults["top2_margin"] = _clamp_with_warn("top2_margin", defaults["top2_margin"], 0.0, 1.0, 0.08, warns)
+    defaults["min_face"] = _clamp_with_warn("min_face", defaults["min_face"], 0, 10000, 110, warns)
+    defaults["det_size"] = _clamp_with_warn("det_size", defaults["det_size"], 64, 4096, 640, warns)
 
-    return defaults, unknown_keys
+    return defaults, (unknown_keys + warns)
 
 CFG_BASE = Path(__file__).parent
-CFG, UNKNOWN_CFG = load_config(CFG_BASE)
+CFG, CFG_WARNINGS = load_config(CFG_BASE)
 
 # ---- Persistence for global stats ----
 def ensure_dir(p: Path):
@@ -205,9 +220,9 @@ def _init_state():
     st.session_state.setdefault("delete_target", None)
     st.session_state.setdefault("delete_originals", bool(CFG.get("delete_originals", False)))
     st.session_state.setdefault("view_filter", "Все")
-    # YOLO defaults
+    # YOLO defaults — max accuracy by default
     st.session_state.setdefault("yolo_enabled", False)
-    st.session_state.setdefault("yolo_model_name", "yolov8n.pt")
+    st.session_state.setdefault("yolo_model_name", "yolov8x.pt")
     st.session_state.setdefault("yolo_conf", 0.25)
     st.session_state.setdefault("yolo_person_gate", True)
     st.session_state.setdefault("yolo_device", "auto")  # auto|cpu|cuda:0
@@ -263,7 +278,7 @@ def load_person_index(group_dir: Path) -> Dict:
             person["thr"] = None
             changed = True
         if "number" not in person:
-            person["number"] = -1  # маркер для пропуска
+            person["number"] = -1
             changed = True
 
     if changed:
@@ -331,7 +346,11 @@ def _update_person_proto(person: Dict, new_vec, k_max: int = 5, ema_alpha: float
     person["ema"] = ema_np.tolist()
     person["count"] = int(person.get("count", 0)) + 1
 
-def safe_copy(src: Path, dst_dir: Path) -> Path:
+# ---- Safe FS ops with sandbox ----
+def safe_copy(src: Path, dst_dir: Path, *, root: Path | None = None) -> Path:
+    if root is not None:
+        if not (_is_subpath(src, root) and _is_subpath(dst_dir, root)):
+            raise RuntimeError("Операция копирования вне рабочей директории запрещена.")
     ensure_dir(dst_dir)
     dst = dst_dir / src.name
     if dst.exists():
@@ -343,7 +362,10 @@ def safe_copy(src: Path, dst_dir: Path) -> Path:
     shutil.copy2(src, dst)
     return dst
 
-def safe_move(src: Path, dst_dir: Path) -> Path:
+def safe_move(src: Path, dst_dir: Path, *, root: Path | None = None) -> Path:
+    if root is not None:
+        if not (_is_subpath(src, root) and _is_subpath(dst_dir, root)):
+            raise RuntimeError("Операция перемещения вне рабочей директории запрещена.")
     ensure_dir(dst_dir)
     dst = dst_dir / src.name
     if dst.exists():
@@ -355,7 +377,7 @@ def safe_move(src: Path, dst_dir: Path) -> Path:
     shutil.move(str(src), str(dst))
     return dst
 
-def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int, Set[Path]]:
+def match_and_apply(group_dir: Path, plan: Dict, match_thr: float, *, root: Path) -> Tuple[int, Set[Path]]:
     import numpy as np
 
     top2_margin = float(CFG.get("top2_margin", 0.08))
@@ -481,7 +503,7 @@ def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int,
                 continue
             dst_dir = group_dir / str(num)
             try:
-                safe_copy(p, dst_dir)
+                safe_copy(p, dst_dir, root=root)
             except Exception:
                 pass
             copied.add(key)
@@ -493,7 +515,7 @@ def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int,
         for img in go:
             p = Path(img)
             try:
-                safe_copy(p, dst_dir)
+                safe_copy(p, dst_dir, root=root)
             except Exception:
                 pass
 
@@ -504,7 +526,7 @@ def match_and_apply(group_dir: Path, plan: Dict, match_thr: float) -> Tuple[int,
         for img in un:
             p = Path(img)
             try:
-                safe_copy(p, dst_dir)
+                safe_copy(p, dst_dir, root=root)
             except Exception:
                 pass
 
@@ -530,7 +552,10 @@ def make_square_thumb(img_path: Path, size: int = 150):
     if Image is None:
         return None
     try:
-        im = Image.open(img_path).convert("RGB")
+        im = Image.open(img_path)
+        if ImageOps is not None:
+            im = ImageOps.exif_transpose(im)
+        im = im.convert("RGB")
         w, h = im.size
         if w != h:
             min_side = min(w, h)
@@ -554,35 +579,111 @@ def get_thumb_bytes(path_str: str, size: int, mtime: float):
     im.save(buf, format="PNG")
     return buf.getvalue()
 
-# ---- YOLO helpers ----
-@st.cache_resource(show_spinner=False)
-def get_yolo_model_cached(model_name: str):
+# ---- YOLO helpers (FIXED) ----
+ULTRA_WEIGHTS_DIR = Path.home() / ".cache" / "ultralytics" / "weights"
+try:
+    ULTRA_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+os.environ.setdefault("YOLO_VERBOSE", "False")
+os.environ.setdefault("ULTRALYTICS_SETTINGS", str(Path.home()/'.config'/'ultralytics'/'settings.json'))
+
+@st.cache_resource(show_spinner=True)
+def get_yolo_model_cached(model_name: str, device: str = "auto", half: bool = True, imgsz: int = 640):
+    """Кэш модели на ключе (model_name, device, half, imgsz) + прогрев."""
     if YOLO is None:
         return None
     try:
-        return YOLO(model_name)
+        weight_path = ULTRA_WEIGHTS_DIR / model_name
+        model = YOLO(str(weight_path))  # скачает вес в указанный путь при отсутствии
+        # привязка устройства
+        try:
+            if device != "auto":
+                model.to(device)
+        except Exception:
+            pass
+        # режим точности
+        try:
+            if half and str(device).startswith("cuda"):
+                model.model.half()
+            else:
+                model.model.float()
+        except Exception:
+            pass
+        # прогрев
+        try:
+            import numpy as np
+            warm = (np.zeros((320, 320, 3), dtype=np.uint8))
+            _ = model.predict(source=warm, imgsz=int(imgsz), conf=0.10, verbose=False)
+        except Exception:
+            pass
+        return model
     except Exception:
         return None
 
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=20000)
-def yolo_people_count_cached(path_str: str, mtime: float, model_name: str, conf: float) -> int:
-    """Return number of 'person' detections (class 0 COCO). Cached by path+mtime+model+conf."""
-    model = get_yolo_model_cached(model_name)
-    if model is None:
-        return 0
+def _predict_person_count(model, path_str: str, imgsz: int, conf: float) -> int:
     try:
-        results = model.predict(source=path_str, imgsz=640, conf=float(conf), verbose=False)
+        results = model.predict(source=path_str, imgsz=int(imgsz), conf=float(conf), verbose=False)
         if not results:
             return 0
         r0 = results[0]
         if not hasattr(r0, 'boxes') or r0.boxes is None:
             return 0
-        # Ultralytics Boxes object; cls is tensor of class ids
         cls = r0.boxes.cls.tolist()
-        # class 0 is 'person' in COCO
         return sum(1 for c in cls if int(c) == 0)
     except Exception:
         return 0
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=20000)
+def yolo_people_count_cached(path_str: str,
+                             mtime: float,
+                             model_name: str,
+                             conf: float,
+                             imgsz: int,
+                             device: str,
+                             half: bool,
+                             timeout_s: int = 15) -> int:
+    """Ключ кэша включает путь+mtime+гиперпараметры; инференс с таймаутом."""
+    model = get_yolo_model_cached(model_name, device=device, half=half, imgsz=imgsz)
+    if model is None:
+        return 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_predict_person_count, model, path_str, imgsz, conf)
+        try:
+            return fut.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError:
+            return 0
+
+def yolo_count_for_image(pth: str) -> int:
+    try:
+        mtime = Path(pth).stat().st_mtime
+    except Exception:
+        mtime = 0.0
+    return yolo_people_count_cached(
+        pth, mtime,
+        st.session_state.get("yolo_model_name", "yolov8x.pt"),
+        float(st.session_state.get("yolo_conf", 0.25)),
+        int(st.session_state.get("yolo_imgsz", 640)),
+        st.session_state.get("yolo_device", "auto"),
+        bool(st.session_state.get("yolo_half", True)),
+    )
+
+# ---- Windows rename validation ----
+WIN_RESERVED = {"CON","PRN","AUX","NUL"} | {f"COM{i}" for i in range(1,10)} | {f"LPT{i}" for i in range(1,10)}
+INVALID_CHARS = set('<>:"/\\|?*')
+
+def is_invalid_name(name: str) -> str | None:
+    if not name or name.strip() == "":
+        return "Имя не может быть пустым."
+    if any(ch in INVALID_CHARS for ch in name):
+        return "Имя содержит недопустимые символы."
+    base = name.rstrip(". ").strip()
+    if base != name:
+        return "Имя не может оканчиваться пробелом или точкой (Windows)."
+    if base.upper() in WIN_RESERVED:
+        return "Имя зарезервировано Windows."
+    return None
 
 # ---- UI State ----
 _init_state()
@@ -602,9 +703,17 @@ except Exception:
     st.markdown(f"[Открыть по сети]({net_url})")
 st.text_input("Network URL", value=net_url, label_visibility="collapsed")
 
-# Warn about unknown config keys
-if UNKNOWN_CFG:
-    st.warning("Найдены неизвестные ключи в config.json: " + ", ".join(sorted(UNKNOWN_CFG)))
+# Warn about config
+if CFG_WARNINGS:
+    for w in CFG_WARNINGS:
+        st.warning(str(w))
+
+# YOLO diagnostics (однократно)
+try:
+    import torch, ultralytics
+    log(f"torch={torch.__version__}, ultralytics={ultralytics.__version__}, cuda={torch.cuda.is_available()}")
+except Exception:
+    pass
 
 if st.session_state["parent_path"] is None:
     st.info("Выберите папку для работы.")
@@ -629,10 +738,11 @@ else:
     curr = Path(st.session_state["current_dir"]).expanduser().resolve()
     parent_root = Path(st.session_state["parent_path"]).expanduser().resolve()
 
-    # Top bar with Up/Refresh/Breadcrumbs (truncated)
+    # Top bar with Up/Refresh/Breadcrumbs (truncated) — root-safe
     top_cols = st.columns([0.08, 0.12, 0.80])
     with top_cols[0]:
-        up = None if curr == Path(curr.anchor) else curr.parent
+        up_candidate = curr.parent
+        up = up_candidate if _is_subpath(up_candidate, parent_root) and up_candidate != curr else None
         st.button(
             "⬆️ Вверх",
             key="up",
@@ -658,7 +768,6 @@ else:
         shown_paths = accum_all
         if len(crumbs) > MAX_CRUMBS:
             shown_parts = crumbs[:2] + ("…",) + crumbs[-(MAX_CRUMBS-3):]
-            # map to paths; ellipsis gets None
             shown_paths = accum_all[:2] + [None] + accum_all[-(MAX_CRUMBS-3):]
         bc_cols = st.columns(len(shown_parts))
         for i, (part, pth) in enumerate(zip(shown_parts, shown_paths)):
@@ -666,11 +775,13 @@ else:
                 if pth is None:
                     st.button("…", disabled=True, use_container_width=True, key=f"bc_dots::{i}")
                 else:
+                    disabled = not _is_subpath(Path(pth), parent_root)
                     st.button(
                         part or "/",
                         key=f"bc::{i}",
                         use_container_width=True,
-                        on_click=lambda p=pth: st.session_state.update({"current_dir": p})
+                        disabled=disabled,
+                        on_click=(lambda p=pth: st.session_state.update({"current_dir": p}) if not disabled else None)
                     )
 
     st.markdown("---")
@@ -678,27 +789,50 @@ else:
     # View filters & YOLO options
     fcols = st.columns([0.33, 0.33, 0.34])
     with fcols[0]:
-        st.session_state["view_filter"] = st.selectbox("Показывать", ["Все", "Только папки", "Только изображения"], index=["Все", "Только папки", "Только изображения"].index(st.session_state["view_filter"]))
+        st.session_state["view_filter"] = st.selectbox(
+            "Показывать", ["Все", "Только папки", "Только изображения"],
+            index=["Все", "Только папки", "Только изображения"].index(st.session_state["view_filter"])
+        )
     with fcols[1]:
-        st.session_state["delete_originals"] = st.checkbox("Удалять оригиналы после копирования (корень группы)", value=st.session_state["delete_originals"]) 
+        st.session_state["delete_originals"] = st.checkbox(
+            "Удалять оригиналы после копирования (корень группы)",
+            value=st.session_state["delete_originals"]
+        )
     with fcols[2]:
-        st.session_state["yolo_enabled"] = st.checkbox("YOLO: детектировать людей (Ultralytics)", value=st.session_state["yolo_enabled"], disabled=(YOLO is None))
+        st.session_state["yolo_enabled"] = st.checkbox(
+            "YOLO: детектировать людей (Ultralytics)",
+            value=st.session_state["yolo_enabled"],
+            disabled=(YOLO is None)
+        )
         if YOLO is None:
             st.caption("Ultralytics не установлен. Установите: pip install ultralytics")
         else:
             ycols = st.columns(2)
             with ycols[0]:
-                st.session_state["yolo_model_name"] = st.selectbox("Модель", ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt"], index=["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt"].index(st.session_state["yolo_model_name"]) if st.session_state["yolo_model_name"] in ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt"] else 0)
+                st.session_state["yolo_model_name"] = st.selectbox(
+                    "Модель (точность →)",
+                    ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"],
+                    index=["yolov8n.pt","yolov8s.pt","yolov8m.pt","yolov8l.pt","yolov8x.pt"].index(
+                        st.session_state["yolo_model_name"]) if st.session_state["yolo_model_name"] in
+                        ["yolov8n.pt","yolov8s.pt","yolov8m.pt","yolov8l.pt","yolov8x.pt"] else 4
+                )
             with ycols[1]:
                 st.session_state["yolo_conf"] = st.slider("Conf", 0.1, 0.9, float(st.session_state["yolo_conf"]), 0.05)
             ycols2 = st.columns(3)
             with ycols2[0]:
-                st.session_state["yolo_device"] = st.selectbox("Device", ["auto","cpu","cuda:0"], index=["auto","cpu","cuda:0"].index(st.session_state["yolo_device"]) if st.session_state["yolo_device"] in ["auto","cpu","cuda:0"] else 0)
+                st.session_state["yolo_device"] = st.selectbox(
+                    "Device", ["auto","cpu","cuda:0"],
+                    index=["auto","cpu","cuda:0"].index(st.session_state["yolo_device"]) if
+                    st.session_state["yolo_device"] in ["auto","cpu","cuda:0"] else 0
+                )
             with ycols2[1]:
                 st.session_state["yolo_imgsz"] = st.slider("imgsz", 320, 1280, int(st.session_state["yolo_imgsz"]), 32)
             with ycols2[2]:
-                st.session_state["yolo_half"] = st.checkbox("half (FP16)", value=bool(st.session_state["yolo_half"]))
-            st.session_state["yolo_person_gate"] = st.checkbox("YOLO-гейтинг лиц (фильтровать лица по людям)", value=st.session_state["yolo_person_gate"])
+                st.session_state["yolo_half"] = st.checkbox("half (FP16, CUDA)", value=bool(st.session_state["yolo_half"]))
+            st.session_state["yolo_person_gate"] = st.checkbox(
+                "YOLO-гейтинг лиц (фильтровать лица по людям)",
+                value=st.session_state["yolo_person_gate"]
+            )
 
     # Header row
     st.markdown('<div class="row hdr"><div>Превью</div><div>Имя</div><div>Тип</div><div>Изменён</div><div>Размер</div></div>', unsafe_allow_html=True)
@@ -750,7 +884,6 @@ else:
                         st.write(f"{icon} {item.name}")
                 with name_cols[1]:
                     if is_dir:
-                        # FIX: непустой лейбл с label_visibility="collapsed"
                         checked = st.checkbox(
                             "Выбрать",
                             key=sel_key,
@@ -794,16 +927,16 @@ else:
                     if st.button("Сохранить", key=f"save::{item}", use_container_width=True):
                         try:
                             candidate = new_name.strip()
-                            if not candidate:
-                                st.error("Имя не может быть пустым.")
+                            err = is_invalid_name(candidate)
+                            if err:
+                                st.error(err)
                             else:
-                                invalid = set('<>:"/\\|?*')
-                                if any(ch in invalid for ch in candidate):
-                                    st.error("Имя содержит недопустимые символы.")
+                                new_path = item.parent / candidate
+                                if new_path.exists() and new_path.resolve() != item.resolve():
+                                    st.error("Файл/папка с таким именем уже существует.")
                                 else:
-                                    new_path = item.parent / candidate
-                                    if new_path.exists():
-                                        st.error("Файл/папка с таким именем уже существует.")
+                                    if not _is_subpath(item, parent_root) or not _is_subpath(new_path.parent, parent_root):
+                                        st.error("Операция вне рабочей директории запрещена.")
                                     else:
                                         item.rename(new_path)
                                         st.session_state["rename_target"] = None
@@ -823,10 +956,12 @@ else:
                 with dc2:
                     if st.button("Удалить", type="primary", key=f"confirm_del::{item}", use_container_width=True):
                         try:
+                            if not _is_subpath(item, parent_root):
+                                raise RuntimeError("Выход за пределы рабочей директории запрещён.")
                             if send2trash is not None:
                                 send2trash(str(item))
                             else:
-                                if is_dir:
+                                if item.is_dir():
                                     shutil.rmtree(item, ignore_errors=True)
                                 else:
                                     item.unlink(missing_ok=True)
@@ -835,7 +970,6 @@ else:
                         except Exception as e:
                             st.error(f"Ошибка удаления: {e}")
                             log(f"Ошибка удаления {item}: {e}")
-                            # оставляем delete_target для повторной попытки/отмены
                 with dc3:
                     if st.button("Отмена", key=f"cancel_del::{item}", use_container_width=True):
                         st.session_state["delete_target"] = None
@@ -862,13 +996,11 @@ else:
                 if not result:
                     st.warning("Нет изменений для переноса.")
                 else:
-                    # result — список словарей с обновлёнными 'items'
                     moves = []
-                    # Индекс 0 — исходная корзина файлов
                     header_to_dir = {f.name: f for f in subfolders}
                     for i, cont in enumerate(result):
                         if i == 0:
-                            continue  # пропускаем исходный контейнер
+                            continue  # исходный контейнер
                         target_name = cont.get("header", "")
                         target_dir = header_to_dir.get(target_name)
                         if not target_dir:
@@ -880,7 +1012,7 @@ else:
                     ok = 0; errors = 0
                     for src, dst_dir in moves:
                         try:
-                            safe_move(src, dst_dir)
+                            safe_move(src, dst_dir, root=parent_root)
                             ok += 1
                         except Exception as e:
                             errors += 1
@@ -923,12 +1055,14 @@ else:
             tot_yolo_dets = 0
             tot_yolo_images = 0
 
+            # Диагностика настроек YOLO перед прогоном
+            log(f"YOLO settings → model={st.session_state.get('yolo_model_name')}, device={st.session_state.get('yolo_device')}, half={st.session_state.get('yolo_half')}, imgsz={st.session_state.get('yolo_imgsz')}, conf={st.session_state.get('yolo_conf')}")
+
             status = st.status("Идёт обработка…", expanded=True)
             with status:
-                # прогресс-бар внутри status
                 prog = st.progress(0, text=f"0/{len(targets)}")
                 for k, gdir in enumerate(targets, start=1):
-                    st.write(f"Обработка: **{gdir.name}**")
+                    st.write(f"Обработка: **{Path(gdir).name}**")
                     try:
                         plan = build_plan(
                             gdir,
@@ -941,7 +1075,7 @@ else:
                             gpu_id=CFG["gpu_id"],
                             # YOLO params for gating in core.cluster
                             yolo_person_gate=bool(st.session_state.get("yolo_person_gate", True)),
-                            yolo_model=str(st.session_state.get("yolo_model_name", "yolov8n.pt")),
+                            yolo_model=str(st.session_state.get("yolo_model_name", "yolov8x.pt")),
                             yolo_conf=float(st.session_state.get("yolo_conf", 0.25)),
                             yolo_imgsz=int(st.session_state.get("yolo_imgsz", 640)),
                             yolo_device=st.session_state.get("yolo_device", "auto"),
@@ -950,34 +1084,31 @@ else:
                         cluster_images = plan.get("cluster_images", {}) or {}
                         faces_detections = sum(len(v) for v in cluster_images.values())
                         unique_people_in_run = len(plan.get("eligible_clusters", []))
+
+                        # joint images (>=2 detections of faces per image)
                         freq = {}
-                        yolo_this_group = 0
-                        yolo_imgs_this_group = 0
                         for imgs in cluster_images.values():
                             for pth in imgs:
                                 freq[pth] = freq.get(pth, 0) + 1
-                                if st.session_state.get("yolo_enabled", False):
-                                    try:
-                                        mtime = Path(pth).stat().st_mtime
-                                    except Exception:
-                                        mtime = 0.0
-                                    cnt = yolo_people_count_cached(str(pth), mtime, st.session_state.get("yolo_model_name", "yolov8n.pt"), float(st.session_state.get("yolo_conf", 0.25)))
-                                    yolo_this_group += cnt
-                                    yolo_imgs_this_group += 1
                         joint_images = sum(1 for v in freq.values() if v >= 2)
 
-                        # Include group_only and unknown into YOLO stats as well
+                        # YOLO metrics
+                        yolo_this_group = 0
+                        yolo_imgs_this_group = 0
                         if st.session_state.get("yolo_enabled", False):
-                            for pth in (plan.get("group_only_images", []) or []) + (plan.get("unknown_images", []) or []):
-                                try:
-                                    mtime = Path(pth).stat().st_mtime
-                                except Exception:
-                                    mtime = 0.0
-                                cnt = yolo_people_count_cached(str(pth), mtime, st.session_state.get("yolo_model_name", "yolov8n.pt"), float(st.session_state.get("yolo_conf", 0.25)))
+                            img_list = []
+                            for imgs in cluster_images.values():
+                                img_list.extend(imgs)
+                            img_list += (plan.get("group_only_images", []) or []) + (plan.get("unknown_images", []) or [])
+                            total_imgs = len(img_list)
+                            for i, pth in enumerate(img_list, start=1):
+                                cnt = yolo_count_for_image(pth)
                                 yolo_this_group += cnt
                                 yolo_imgs_this_group += 1
+                                if i % 20 == 0:
+                                    st.write(f"YOLO: обработано {i}/{total_imgs}")
 
-                        persons_after, processed_images = match_and_apply(gdir, plan, match_thr=CFG["match_thr"])
+                        persons_after, processed_images = match_and_apply(gdir, plan, match_thr=CFG["match_thr"], root=parent_root)
                         idx["group_counts"][str(gdir)] = persons_after
                         cleanup_processed_images(gdir, processed_images, delete_originals=st.session_state.get("delete_originals", False))
 
@@ -992,17 +1123,17 @@ else:
                             tot_yolo_images += yolo_imgs_this_group
 
                         st.success(
-                            f"{gdir.name}: фото={plan['stats']['images_total']}, уник.людей={unique_people_in_run}, "
+                            f"{Path(gdir).name}: фото={plan['stats']['images_total']}, уник.людей={unique_people_in_run}, "
                             f"детекций лиц={faces_detections}, group_only={plan['stats']['images_group_only']}, совместных={joint_images}" +
                             (f", YOLO детекций людей={yolo_this_group}, ср.на фото={yolo_this_group/max(1,yolo_imgs_this_group):.2f}" if st.session_state.get("yolo_enabled", False) else "")
                         )
                         st.session_state["proc_logs"].append(
-                            f"{gdir.name}: людей(детекции)={faces_detections}; уникальные люди={unique_people_in_run}; "
+                            f"{Path(gdir).name}: людей(детекции)={faces_detections}; уникальные люди={unique_people_in_run}; "
                             f"общие(group_only)={plan['stats']['images_group_only']}; совместные(>1 человек)={joint_images}"
                         )
                     except Exception as e:
-                        st.error(f"Ошибка в {gdir.name}: {e}")
-                        st.session_state["proc_logs"].append(f"{gdir.name}: ошибка — {e}")
+                        st.error(f"Ошибка в {Path(gdir).name}: {e}")
+                        st.session_state["proc_logs"].append(f"{Path(gdir).name}: ошибка — {e}")
 
                     prog.progress(k / len(targets), text=f"{k}/{len(targets)}")
 
@@ -1049,3 +1180,11 @@ else:
             log_text = "\n".join(st.session_state.get("proc_logs", []))
             st.text_area("Логи", value=log_text, height=220)
             st.download_button("Скачать логи", data=log_text, file_name="proc_logs.txt")
+
+    # Optional: кнопка сброса глобальной статистики
+    with st.expander("Сервисные операции", expanded=False):
+        if st.button("Сбросить накопительные global_stats", use_container_width=True):
+            idx = load_index(parent_root)
+            idx["global_stats"] = {"images_total": 0, "images_unknown_only": 0, "images_group_only": 0}
+            save_index(parent_root, idx)
+            st.success("Счётчики сброшены.")
