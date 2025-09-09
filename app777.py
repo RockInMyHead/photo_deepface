@@ -107,13 +107,13 @@ def load_config(base: Path) -> Dict:
         "min_det_score": 0.70,
         "min_quality": 0.70
     }
-    if p.exists():
-        try:
-            user_cfg = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(user_cfg, dict):
-                defaults.update({k: user_cfg[k] for k in user_cfg})
-        except Exception:
-            pass
+    #if p.exists():
+     #   try:
+      #      user_cfg = json.loads(p.read_text(encoding="utf-8"))
+       #     if isinstance(user_cfg, dict):
+        #        defaults.update({k: user_cfg[k] for k in user_cfg})
+       # except Exception:
+       #     pass
 
     defaults["eps_sim"] = _clamp(defaults["eps_sim"], 0.0, 1.0, 0.55)
     defaults["match_thr"] = _clamp(defaults["match_thr"], 0.0, 1.0, 0.52)
